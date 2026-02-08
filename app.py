@@ -413,21 +413,93 @@ if run:
     # STEP 2 — Retrieve the 5 Most Relevant Wikipedia Pages
     # =================================================================
     # Task: Retrieve the 5 most relevant Wikipedia pages for the industry.
-    # Subtasks: Search Wikipedia with multiple queries, identify key players
-    # using LLM, retrieve player pages, and use LLM to select the best pages.
+    # 
+    # Approach: Content-based relevance scoring
+    # Instead of selecting pages by title alone (which can be misleading —
+    # e.g., "EA" appears for "Electronics" but is actually a gaming company),
+    # we send article CONTENT snippets to Gemini for relevance scoring.
+    # Articles scoring below the threshold are rejected, and the system
+    # re-searches until 5 relevant articles are found or options are exhausted.
     #
-    # Why this approach? Simple keyword search often returns irrelevant pages
-    # (e.g., "AI slop" or "Generative AI pornography" for Generative AI).
-    # Using the LLM to identify key players and select pages ensures we get
-    # business-relevant content. This approach is generalised — it works for
-    # ANY industry without hardcoded filters or blocklists.
+    # Flow:
+    #   2A. Search Wikipedia with multiple queries → collect candidates
+    #   2B. Filter out Wikipedia meta pages and stubs
+    #   2C. Send article titles + content snippets to Gemini → score relevance
+    #   2D. Keep articles scoring above threshold, reject the rest
+    #   2E. If < 5 found, identify key players and search for more candidates
+    #   2F. Score new candidates and repeat until 5 found or exhausted
     st.subheader("Step 2: Retrieving Wikipedia Pages")
+
+    # Relevance score threshold (1-10 scale)
+    # Articles scoring below this are rejected as irrelevant
+    RELEVANCE_THRESHOLD = 7
+
+    # -----------------------------------------------------------------
+    # Helper: Score articles using Gemini (reads content, not just titles)
+    # -----------------------------------------------------------------
+    def score_articles(candidate_docs, industry, client, model_name, max_retries):
+        """
+        Send article titles + content snippets to Gemini for relevance scoring.
+        Gemini reads the first 300 words of each article to determine if the
+        article is genuinely relevant to the industry (not just keyword match).
+        
+        Returns a list of dicts: [{"index": 0, "score": 9, "reason": "..."}]
+        """
+        # Build snippets: title + first 300 words of content for each candidate
+        snippets = []
+        for i, doc in enumerate(candidate_docs):
+            title = doc.metadata.get("title", "Unknown")
+            # Use first 300 words — enough for Gemini to understand what the article is about
+            content_preview = " ".join(doc.page_content.split()[:300])
+            snippets.append(f"[{i}] {title}\n{content_preview}\n")
+        
+        snippets_text = "\n---\n".join(snippets)
+        
+        score_prompt = (
+            f"You are a market research analyst. Score each Wikipedia article below "
+            f"on how RELEVANT it is for writing a market research report about "
+            f"the **{industry}** industry.\n\n"
+            f"IMPORTANT: Read the article content carefully, not just the title. "
+            f"A company might have a name that sounds related but actually operates "
+            f"in a completely different industry (e.g., 'Electronic Arts' sounds like "
+            f"electronics but is actually a gaming company).\n\n"
+            f"Score each article 1-10:\n"
+            f"- 9-10: Directly about this industry or a major player in it\n"
+            f"- 7-8: Relevant technology, market, or significant company\n"
+            f"- 4-6: Loosely related but not core to this industry\n"
+            f"- 1-3: Unrelated or wrong industry entirely\n\n"
+            f"Articles:\n{snippets_text}\n\n"
+            f"Return ONLY a JSON array, one object per article:\n"
+            f'[{{"index": 0, "score": 9, "reason": "brief reason"}}, ...]\n'
+            f"Include ALL articles. No markdown, no extra text."
+        )
+        
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    time.sleep(60 * attempt)
+                score_response = client.models.generate_content(
+                    model=model_name,
+                    contents=score_prompt,
+                    config=types.GenerateContentConfig(temperature=0.0),
+                )
+                score_text = score_response.text.strip()
+                if score_text.startswith("```"):
+                    score_text = score_text.split("```")[1]
+                    if score_text.startswith("json"):
+                        score_text = score_text[4:]
+                return json.loads(score_text)
+            except Exception as e:
+                if "RESOURCE_EXHAUSTED" in str(e) and attempt < max_retries - 1:
+                    continue
+                else:
+                    return None
+        return None
 
     # -----------------------------------------------------------------
     # STEP 2A — Search Wikipedia with multiple query variations
     # -----------------------------------------------------------------
-    # We search with 3 different queries to cast a wide net and increase
-    # the chance of finding industry overview pages and major companies
+    # Search with multiple query formats to cast a wide net
     with st.spinner("Searching Wikipedia…"):
         search_queries = [
             f"{industry} industry",   # Targets industry overview pages
@@ -438,7 +510,6 @@ if run:
         all_docs = []          # Stores all retrieved Wikipedia documents
         seen_titles = set()    # Tracks page titles to prevent duplicates
         
-        # WikipediaRetriever fetches up to top_k_results pages per query
         retriever = WikipediaRetriever(top_k_results=5, load_max_docs=5)
         
         for query in search_queries:
@@ -446,15 +517,12 @@ if run:
                 results = retriever.invoke(query)
                 for doc in results:
                     title = doc.metadata.get("title", "")
-                    # Only add pages we haven't seen yet (avoid duplicates)
                     if title not in seen_titles:
                         seen_titles.add(title)
                         all_docs.append(doc)
             except Exception:
-                # If a query fails (network error, etc.), skip and try next
                 continue
 
-    # If no pages found at all, we cannot proceed
     if not all_docs:
         st.error(
             "No Wikipedia pages found for this industry. "
@@ -462,97 +530,9 @@ if run:
         )
         st.stop()
 
-    # Select the longest page as the best industry overview
-    # Longer Wikipedia pages tend to be more comprehensive overview articles
-    best_overview = max(all_docs, key=lambda d: len(d.page_content))
-    overview_text = best_overview.page_content[:6000]  # Truncate to fit token limits
-
     # -----------------------------------------------------------------
-    # STEP 2B — Use Gemini to identify key players from the overview
+    # STEP 2B — Filter out Wikipedia meta pages and stubs
     # -----------------------------------------------------------------
-    # Instead of relying on keyword matching (which misses many companies),
-    # we ask Gemini to read the overview page and identify the most important
-    # companies. This ensures we get pages for major players like Google,
-    # Microsoft, OpenAI etc. rather than niche entities.
-    with st.spinner("Analysing industry…"):
-        identify_prompt = (
-            f"Based on the following Wikipedia content about the {industry} industry, "
-            f"list the 6-8 most important COMPANIES in this industry globally. "
-            f"Focus on the largest, most dominant companies by revenue, market cap, "
-            f"or market share. Prioritize industry leaders and major corporations over "
-            f"smaller startups or niche players. "
-            f"Do NOT include concepts, technologies, datasets, or non-company entities. "
-            f"Only include real company/organization names. "
-            f"Return ONLY a JSON array of company names, nothing else. "
-            f"Example: [\"Google\", \"Microsoft\", \"OpenAI\", \"Anthropic\", \"Meta\"]\n\n"
-            f"Content:\n{overview_text}"
-        )
-        
-        key_players = []
-        for attempt in range(max_retries):
-            try:
-                if attempt > 0:
-                    # Exponential backoff: wait longer between each retry
-                    time.sleep(60 * attempt)
-                identify_response = client.models.generate_content(
-                    model=model_name,
-                    contents=identify_prompt,
-                    config=types.GenerateContentConfig(temperature=0.0),
-                )
-                # Parse the JSON array from Gemini's response
-                players_text = identify_response.text.strip()
-                # Handle case where Gemini wraps response in ```json ... ```
-                if players_text.startswith("```"):
-                    players_text = players_text.split("```")[1]
-                    if players_text.startswith("json"):
-                        players_text = players_text[4:]
-                key_players = json.loads(players_text)
-                break
-            except Exception as e:
-                if "RESOURCE_EXHAUSTED" in str(e) and attempt < max_retries - 1:
-                    # API rate limit hit — wait and retry
-                    continue
-                else:
-                    # If all retries fail, proceed without key players
-                    # (the report will still use pages from Step 2A)
-                    key_players = []
-                    break
-
-    # -----------------------------------------------------------------
-    # STEP 2C — Search Wikipedia for each identified key player
-    # -----------------------------------------------------------------
-    # For each company Gemini identified, we search Wikipedia to get their
-    # dedicated page. This ensures we have company-specific data for the report.
-    if key_players:
-        with st.spinner("Retrieving relevant pages…"):
-            # top_k_results=1 since we want the exact company page
-            player_retriever = WikipediaRetriever(top_k_results=1, load_max_docs=1)
-            for player in key_players:
-                # Skip if we already have this page from Step 2A
-                if player in seen_titles:
-                    continue
-                try:
-                    player_docs = player_retriever.invoke(player)
-                    if player_docs:
-                        doc = player_docs[0]
-                        title = doc.metadata.get("title", "")
-                        if title not in seen_titles:
-                            seen_titles.add(title)
-                            all_docs.append(doc)
-                except Exception:
-                    # If a search fails, skip this player and continue
-                    continue
-
-    # -----------------------------------------------------------------
-    # STEP 2D — Use Gemini to select the 5 most relevant pages
-    # -----------------------------------------------------------------
-    # Instead of hardcoded scoring rules (which don't generalise to all
-    # industries), we send all candidate titles to Gemini and ask it to
-    # pick the 5 most relevant for market research. This is the key
-    # innovation — the LLM acts as an intelligent filter that works
-    # for ANY industry without industry-specific rules.
-    
-    # Basic filter: remove only Wikipedia system/meta pages and very short stubs
     excluded_keywords = [
         "disambiguation", "list of", "index of", "category:", 
         "portal:", "template:", "wikipedia:", "file:"
@@ -561,10 +541,8 @@ if run:
     candidate_docs = []
     for doc in all_docs:
         title = doc.metadata.get("title", "").lower()
-        # Skip Wikipedia internal/meta pages
         if any(kw in title for kw in excluded_keywords):
             continue
-        # Skip pages with fewer than 100 words (likely stubs)
         if len(doc.page_content.split()) < 100:
             continue
         candidate_docs.append(doc)
@@ -573,85 +551,145 @@ if run:
         st.error("No relevant pages found. Please try a different industry.")
         st.stop()
 
-    # Build a numbered list of candidate titles for Gemini to choose from
-    title_list = []
-    for i, doc in enumerate(candidate_docs):
-        title = doc.metadata.get("title", "Unknown")
-        title_list.append(f"{i}: {title}")
-    
-    titles_text = "\n".join(title_list)
-    
-    # Prompt instructs Gemini to act as a market research analyst
-    # and select the 5 most useful pages, excluding irrelevant content
-    select_prompt = (
-        f"You are a market research analyst. From the following Wikipedia page titles, "
-        f"select the 5 MOST RELEVANT pages for writing a market research report about "
-        f"the **{industry}** industry.\n\n"
-        f"Prioritize pages about:\n"
-        f"- The industry itself (overview, market, sector)\n"
-        f"- Major companies/key players in this industry\n"
-        f"- Core technologies or products in this industry\n\n"
-        f"Exclude pages about:\n"
-        f"- Specific countries or regions\n"
-        f"- Social issues, ethics, controversies\n"
-        f"- Unrelated or tangential topics\n"
-        f"- Individual people/biographies\n\n"
-        f"Available pages:\n{titles_text}\n\n"
-        f"Return ONLY a JSON array of the index numbers of your top 5 choices, "
-        f"ordered from most to least relevant. Example: [0, 3, 7, 2, 5]"
-    )
+    # -----------------------------------------------------------------
+    # STEP 2C — Score candidates by reading article CONTENT (not just titles)
+    # -----------------------------------------------------------------
+    # Gemini reads first 300 words of each article and scores relevance 1-10.
+    # This catches cases where a title sounds relevant but content is not
+    # (e.g., "Electronic Arts" for "Electronics" industry).
+    with st.spinner("Evaluating article relevance…"):
+        scores = score_articles(candidate_docs, industry, client, model_name, max_retries)
 
-    selected_indices = None
-    with st.spinner("Selecting best pages…"):
-        for attempt in range(max_retries):
-            try:
-                if attempt > 0:
-                    time.sleep(60 * attempt)
-                select_response = client.models.generate_content(
-                    model=model_name,
-                    contents=select_prompt,
-                    config=types.GenerateContentConfig(temperature=0.0),
-                )
-                # Parse JSON array of selected page indices
-                select_text = select_response.text.strip()
-                if select_text.startswith("```"):
-                    select_text = select_text.split("```")[1]
-                    if select_text.startswith("json"):
-                        select_text = select_text[4:]
-                selected_indices = json.loads(select_text)
-                break
-            except Exception as e:
-                if "RESOURCE_EXHAUSTED" in str(e) and attempt < max_retries - 1:
-                    continue
+    # -----------------------------------------------------------------
+    # STEP 2D — Keep articles above threshold, reject the rest
+    # -----------------------------------------------------------------
+    approved_docs = []
+    rejected_titles = []
+    
+    if scores:
+        for item in scores:
+            idx = item.get("index", -1)
+            score = item.get("score", 0)
+            reason = item.get("reason", "")
+            if 0 <= idx < len(candidate_docs):
+                title = candidate_docs[idx].metadata.get("title", "Unknown")
+                if score >= RELEVANCE_THRESHOLD:
+                    approved_docs.append(candidate_docs[idx])
                 else:
-                    selected_indices = None
-                    break
-
-    # Use Gemini's selection if valid; fall back to first 5 candidates otherwise
-    if selected_indices and isinstance(selected_indices, list):
-        docs = []
-        for idx in selected_indices:
-            # Validate each index is a valid integer within range
-            if isinstance(idx, int) and 0 <= idx < len(candidate_docs):
-                docs.append(candidate_docs[idx])
-        # If Gemini returned too few valid indices, use fallback
-        if len(docs) < 3:
-            docs = candidate_docs[:5]
+                    rejected_titles.append(f"{title} (score: {score}/10 — {reason})")
     else:
-        # Fallback: use the first 5 candidates in order
-        docs = candidate_docs[:5]
+        # If scoring fails, fall back to using all candidates
+        approved_docs = candidate_docs
 
-    # Handle edge case: no pages could be selected
+    # Rejected articles are filtered out but not displayed in the UI
+    # if rejected_titles:
+    #     with st.expander(f"🔍 {len(rejected_titles)} article(s) rejected as irrelevant"):
+    #         for r in rejected_titles:
+    #             st.caption(f"❌ {r}")
+
+    # -----------------------------------------------------------------
+    # STEP 2E — If fewer than 5, search for key players and score them too
+    # -----------------------------------------------------------------
+    # When initial search doesn't yield enough relevant articles,
+    # we ask Gemini to identify key companies from the best overview page,
+    # search Wikipedia for those companies, and score the new results.
+    if len(approved_docs) < 5:
+        # Find the best overview from approved articles (or all candidates as fallback)
+        source_docs = approved_docs if approved_docs else candidate_docs
+        best_overview = max(source_docs, key=lambda d: len(d.page_content))
+        overview_text = best_overview.page_content[:6000]
+        
+        with st.spinner("Searching for more relevant articles…"):
+            # Ask Gemini to identify key players from overview
+            identify_prompt = (
+                f"Based on the following Wikipedia content about the {industry} industry, "
+                f"list the 6-8 most important COMPANIES in this industry globally. "
+                f"Focus on the largest, most dominant companies by revenue, market cap, "
+                f"or market share. Prioritize industry leaders and major corporations over "
+                f"smaller startups or niche players. "
+                f"Do NOT include concepts, technologies, datasets, or non-company entities. "
+                f"Return ONLY a JSON array of company names, nothing else. "
+                f"Example: [\"Google\", \"Microsoft\", \"OpenAI\"]\n\n"
+                f"Content:\n{overview_text}"
+            )
+            
+            key_players = []
+            for attempt in range(max_retries):
+                try:
+                    if attempt > 0:
+                        time.sleep(60 * attempt)
+                    identify_response = client.models.generate_content(
+                        model=model_name,
+                        contents=identify_prompt,
+                        config=types.GenerateContentConfig(temperature=0.0),
+                    )
+                    players_text = identify_response.text.strip()
+                    if players_text.startswith("```"):
+                        players_text = players_text.split("```")[1]
+                        if players_text.startswith("json"):
+                            players_text = players_text[4:]
+                    key_players = json.loads(players_text)
+                    break
+                except Exception as e:
+                    if "RESOURCE_EXHAUSTED" in str(e) and attempt < max_retries - 1:
+                        continue
+                    else:
+                        key_players = []
+                        break
+            
+            # Search Wikipedia for each key player
+            new_candidates = []
+            if key_players:
+                player_retriever = WikipediaRetriever(top_k_results=1, load_max_docs=1)
+                approved_titles = set(d.metadata.get("title", "") for d in approved_docs)
+                
+                for player in key_players:
+                    if player in seen_titles:
+                        continue
+                    try:
+                        player_docs = player_retriever.invoke(player)
+                        if player_docs:
+                            doc = player_docs[0]
+                            title = doc.metadata.get("title", "")
+                            if title not in seen_titles and title not in approved_titles:
+                                seen_titles.add(title)
+                                # Skip stubs
+                                if len(doc.page_content.split()) >= 100:
+                                    new_candidates.append(doc)
+                    except Exception:
+                        continue
+            
+            # Score the new candidates using content-based relevance
+            if new_candidates:
+                new_scores = score_articles(new_candidates, industry, client, model_name, max_retries)
+                if new_scores:
+                    for item in new_scores:
+                        idx = item.get("index", -1)
+                        score = item.get("score", 0)
+                        reason = item.get("reason", "")
+                        if 0 <= idx < len(new_candidates):
+                            title = new_candidates[idx].metadata.get("title", "Unknown")
+                            if score >= RELEVANCE_THRESHOLD:
+                                approved_docs.append(new_candidates[idx])
+                            else:
+                                rejected_titles.append(f"{title} (score: {score}/10 — {reason})")
+
+    # -----------------------------------------------------------------
+    # STEP 2F — Final selection: take top 5 by relevance, handle shortfall
+    # -----------------------------------------------------------------
+    # Limit to 5 articles maximum
+    docs = approved_docs[:5]
+
     if len(docs) == 0:
         st.error("No relevant pages found. Please try a different industry.")
         st.stop()
     
-    # Warn user if fewer than 5 pages were found
-    # The report will still proceed with whatever pages are available
+    # If fewer than 5 relevant articles found, warn user with suggestion
     if len(docs) < 5:
         st.warning(
             f"⚠️ Only {len(docs)} relevant Wikipedia pages found (target: 5). "
-            "The report will proceed with available pages, but results may be limited."
+            "Consider adjusting your industry name for better results "
+            "(e.g., 'Consumer Electronics' instead of 'Electronics')."
         )
 
     # Extract URLs and titles, then display as clickable links
