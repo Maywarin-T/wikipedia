@@ -1,257 +1,152 @@
-# =============================================================================
-# Market Research Assistant — Streamlit Application
-# =============================================================================
-# This app generates a market research report for any industry using:
-# 1. Wikipedia as the data source (via LangChain's WikipediaRetriever)
-# 2. Google Gemini LLM for intelligent page selection and report generation
-# 3. PESTEL analysis with radar chart visualisation
-# 4. PDF export using ReportLab
-#
-# Architecture:
-#   User Input → Wikipedia Search → LLM Key Player Identification →
-#   LLM Page Selection → LLM Report Generation → LLM PESTEL Scoring →
-#   Radar Chart + PDF Export
-# =============================================================================
+# Market Research Assistant
+# A Streamlit app that generates market research reports using Wikipedia + Google Gemini.
+# The user types an industry, we find the best Wikipedia pages, and Gemini writes a report.
 
-# --- Standard library imports ---
-import time          # For retry delays when hitting API rate limits
-import json          # For parsing JSON responses from Gemini
-import io            # For in-memory file buffers (PDF generation)
-import re            # For regex-based text cleaning (word count)
+# Standard library stuff
+import time
+import json
+import io
+import re
 
-# --- Data and visualisation libraries ---
-import numpy as np           # For calculating radar chart angles
-import matplotlib.pyplot as plt  # For drawing the PESTEL radar chart
-
-# --- Streamlit (web app framework) ---
+# Streamlit for the web app
 import streamlit as st
-import pandas as pd
 
-# --- Wikipedia retrieval (LangChain) ---
-# WikipediaRetriever searches Wikipedia and returns document objects
-# containing page content and metadata (title, URL)
+# Wikipedia retrieval from LangChain
 from langchain_community.retrievers import WikipediaRetriever
 
-# --- Google Gemini API (LLM) ---
-# genai is the Google Generative AI client library
-# types provides configuration objects like GenerateContentConfig
+# Google Gemini LLM
 from google import genai
 from google.genai import types
 
-# --- PDF generation (ReportLab) ---
+# PDF generation
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.lib import colors
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-)
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
-# =============================================================================
-# Page Configuration & Welcome Message
-# =============================================================================
-# set_page_config must be the first Streamlit command
+
+# Page setup (must be first Streamlit command)
 st.set_page_config(page_title="Market Research Assistant", page_icon="📊")
 st.title("📊 Market Research Assistant")
 st.markdown(
-    "Welcome! I'm your market research assistant. "
-    "Simply enter an industry name below and I'll generate a concise report "
-    "based on the most relevant Wikipedia pages — including key players, trends, "
-    "outlook, and a PESTEL analysis."
+    "Enter an industry name below and I'll generate a concise market research report "
+    "based on the most relevant Wikipedia pages."
 )
 
-# =============================================================================
-# Sidebar — User Settings
-# =============================================================================
-# The sidebar allows users to configure their API key and model choice
-# without cluttering the main interface
+
+# Sidebar for settings
 with st.sidebar:
     st.header("Settings")
-
-    # API key input — masked with type="password" for security
     api_key = st.text_input("Google Gemini API Key", type="password")
-
-    # Model selection — includes preset options and a custom input field
-    # so the teacher can use any model they have access to
     model_options = ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-2.5-flash-preview-05-20", "Custom"]
-    model_choice = st.selectbox(
-        "Model",
-        model_options,
-        index=0,
-        help="gemini-2.0-flash is recommended. Select 'Custom' to enter your own model name.",
-    )
-    # If "Custom" is selected, show a text input for the user to type any model name
+    model_choice = st.selectbox("Model", model_options, index=0)
     if model_choice == "Custom":
         model_name = st.text_input("Enter model name", placeholder="e.g. gemini-1.5-pro")
     else:
         model_name = model_choice
 
-    # Temperature set to 0 for deterministic, factual outputs
-    # (not exposed in UI — we want consistent, reproducible reports)
-    temperature = 0.0
 
-# =============================================================================
-# LLM Prompts (not displayed on the UI)
-# =============================================================================
-# System prompt defines the LLM's role and output format.
-# It instructs Gemini to act as a senior market research analyst
-# and produce a structured report with 4 sections under 500 words.
-system_prompt = (
-    "You are a senior market research analyst at a top-tier consulting firm. "
-    "Write a concise, professional industry report based on the Wikipedia "
-    "sources provided.\n\n"
-    "CRITICAL: The report MUST be less than 500 words. Aim for around 400-450 words. "
-    "Be thorough but concise.\n\n"
-    "You MUST include ALL four of the following sections:\n"
-    "1. **Industry Overview** — Define the industry scope, estimated global market size "
-    "(if mentioned), key segments, and value chain.\n"
-    "2. **Key Players & Market Structure** — Identify 3-5 major companies and their "
-    "competitive positioning. Keep descriptions brief (1 sentence per company max).\n"
-    "3. **Recent Trends & Developments** — Focus on 2-3 key technological shifts, "
-    "regulatory changes, or investment trends with clear business impact.\n"
-    "4. **Outlook** — Provide a forward-looking perspective on growth trajectory "
-    "and emerging risks in 2-3 sentences.\n\n"
-    "IMPORTANT GUIDELINES:\n"
-    "- Include quantitative data (market size, growth rates, revenue) when available.\n"
-    "- Name specific companies and products — avoid vague statements.\n"
-    "- Write like a McKinsey analyst, not a Wikipedia summary.\n"
-    "- Only state facts directly supported by the sources. Do NOT fabricate data.\n"
-    "- If a data point is not in the sources, omit it — do NOT guess.\n"
-    "- Use clear, business-appropriate language with a global industry perspective."
-)
+# HELPER: Call Gemini with retry logic
+# Gemini's free tier has low rate limits, so we retry with increasing waits.
+# This one function handles all LLM calls so we don't repeat retry code everywhere.
+def call_gemini(client, model, prompt, system_instruction=None, temperature=0.0):
+    max_retries = 5
+    config = types.GenerateContentConfig(temperature=temperature)
+    if system_instruction:
+        config = types.GenerateContentConfig(
+            temperature=temperature,
+            system_instruction=system_instruction,
+        )
+    for attempt in range(max_retries):
+        try:
+            if attempt > 0:
+                wait = 60 * attempt
+                time.sleep(wait)
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=config,
+            )
+            return response.text.strip()
+        except Exception as e:
+            error_msg = str(e)
+            if "RESOURCE_EXHAUSTED" in error_msg and attempt < max_retries - 1:
+                continue
+            elif "API_KEY_INVALID" in error_msg or "PERMISSION_DENIED" in error_msg:
+                return None
+            else:
+                return None
+    return None
 
-# User prompt template — gets filled with the industry name and Wikipedia context
-user_prompt = (
-    "Write a market research report on the **{industry}** industry.\n\n"
-    "Extract business-relevant data from these sources. "
-    "Only include facts directly stated in the sources — do not invent data.\n\n"
-    "Wikipedia Sources:\n\n{context}"
-)
 
-# =============================================================================
-# Helper Function: Convert Wikipedia Documents to Plain Text
-# =============================================================================
-def convert_docs_to_text(docs, max_chars_per_doc=3000):
-    """
-    Convert WikipediaRetriever document objects into a single formatted
-    text string that can be sent to the LLM as context.
-    
-    Each document is formatted with its title, source URL, and content
-    (truncated to max_chars_per_doc to stay within token limits).
-    
-    Args:
-        docs: List of Document objects from WikipediaRetriever
-        max_chars_per_doc: Maximum characters per document (prevents token overflow)
-    
-    Returns:
-        String containing all documents formatted as plain text
-    """
-    context_parts = []
+# HELPER: Parse JSON from Gemini's response
+# Gemini sometimes wraps JSON in ```json ... ``` markdown blocks.
+# This strips that away so we can parse the actual JSON.
+def parse_json(text):
+    if not text:
+        return None
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+    try:
+        return json.loads(text.strip())
+    except json.JSONDecodeError:
+        return None
+
+
+# HELPER: Turn Wikipedia documents into plain text for Gemini
+# Each page gets a title, URL, and the first N characters of content.
+def docs_to_text(docs, max_chars=5000):
+    parts = []
     for doc in docs:
-        # Extract metadata from the document object
         title = doc.metadata.get("title", "Unknown")
-        source_url = doc.metadata.get("source", "")
-        
-        # Truncate content to prevent exceeding LLM token limits
-        content = doc.page_content[:max_chars_per_doc]
-        
-        # Format with clear section markers so the LLM can distinguish sources
-        text_section = f"### {title}\n"
-        if source_url:
-            text_section += f"Source: {source_url}\n\n"
-        text_section += content
-        
-        context_parts.append(text_section)
-    
-    return "\n\n".join(context_parts)
+        url = doc.metadata.get("source", "")
+        content = doc.page_content[:max_chars]
+        parts.append(f"### {title}\nSource: {url}\n\n{content}")
+    return "\n\n".join(parts)
 
-# =============================================================================
-# Helper Function: Generate PDF Report
-# =============================================================================
-def generate_pdf(industry, report_text, sources, pestel_data=None):
-    """
-    Generate a downloadable PDF report containing:
-    - Report title and Wikipedia source links
-    - Full report text with markdown headings converted to PDF styles
-    - PESTEL radar chart (as embedded image) and explanations table
-    
-    Uses ReportLab to build the PDF in memory (BytesIO buffer).
-    
-    Args:
-        industry: Name of the industry (string)
-        report_text: The generated report text from Gemini (string)
-        sources: List of dicts with 'title' and 'url' keys
-        pestel_data: Dict with 'scores' and 'explanations' (optional)
-    
-    Returns:
-        BytesIO buffer containing the PDF file ready for download
-    """
-    from reportlab.lib.utils import ImageReader
-    
-    # Create an in-memory buffer to write the PDF to (no temp file needed)
+
+# HELPER: Generate PDF report
+# Creates a nice PDF with the report text, sources, and SWOT table.
+def generate_pdf(industry, report_text, sources, swot_data=None):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer, pagesize=A4,
         leftMargin=20*mm, rightMargin=20*mm,
         topMargin=20*mm, bottomMargin=20*mm,
     )
-    
-    # Get default styles and add custom ones for our report layout
+
     styles = getSampleStyleSheet()
-    
-    # Large title style for the report header
-    styles.add(ParagraphStyle(
-        name="ReportTitle", parent=styles["Title"],
-        fontSize=20, spaceAfter=12,
-    ))
-    # Section heading style (e.g., "Industry Overview", "Key Players")
-    styles.add(ParagraphStyle(
-        name="SectionHead", parent=styles["Heading2"],
-        fontSize=13, spaceBefore=14, spaceAfter=6,
-    ))
-    # Body text style for report paragraphs
-    styles.add(ParagraphStyle(
-        name="BodyText2", parent=styles["Normal"],
-        fontSize=10, leading=14, spaceAfter=8,
-    ))
-    # Small grey text for footer
-    styles.add(ParagraphStyle(
-        name="SmallText", parent=styles["Normal"],
-        fontSize=8, leading=10, textColor=colors.grey,
-    ))
-    # Table cell styles for PESTEL explanations table
-    styles.add(ParagraphStyle(
-        name="CellText", parent=styles["Normal"],
-        fontSize=9, leading=12,
-    ))
-    styles.add(ParagraphStyle(
-        name="CellBold", parent=styles["Normal"],
-        fontSize=10, leading=13, fontName="Helvetica-Bold",
-    ))
-    
-    # story = ordered list of PDF elements (paragraphs, tables, images)
+    styles.add(ParagraphStyle(name="ReportTitle", parent=styles["Title"], fontSize=20, spaceAfter=12))
+    styles.add(ParagraphStyle(name="SectionHead", parent=styles["Heading2"], fontSize=13, spaceBefore=14, spaceAfter=6))
+    styles.add(ParagraphStyle(name="Body", parent=styles["Normal"], fontSize=10, leading=14, spaceAfter=8))
+    styles.add(ParagraphStyle(name="Small", parent=styles["Normal"], fontSize=8, leading=10, textColor=colors.grey))
+    styles.add(ParagraphStyle(name="Cell", parent=styles["Normal"], fontSize=9, leading=12))
+    styles.add(ParagraphStyle(name="CellBold", parent=styles["Normal"], fontSize=10, leading=13, fontName="Helvetica-Bold"))
+
     story = []
-    
-    # --- Report Title ---
+
+    # Title
     story.append(Paragraph(f"{industry} Industry Report", styles["ReportTitle"]))
     story.append(Spacer(1, 4))
-    
-    # --- Wikipedia Sources (displayed as clickable hyperlinks) ---
+
+    # Sources
     story.append(Paragraph("Sources", styles["SectionHead"]))
     for i, src in enumerate(sources, 1):
         story.append(Paragraph(
             f'{i}. <a href="{src["url"]}" color="blue">{src["title"]}</a>',
-            styles["BodyText2"],
+            styles["Body"],
         ))
     story.append(Spacer(1, 6))
-    
-    # --- Report Body ---
-    # Parse each line from the LLM output and apply appropriate PDF styling
+
+    # Report body
     for line in report_text.split("\n"):
         line = line.strip()
         if not line:
             continue
-        # Convert markdown headings (# ## ###) to PDF section headings
         if line.startswith("# "):
             story.append(Paragraph(line[2:], styles["SectionHead"]))
         elif line.startswith("## "):
@@ -259,74 +154,32 @@ def generate_pdf(industry, report_text, sources, pestel_data=None):
         elif line.startswith("### "):
             story.append(Paragraph(line[4:], styles["SectionHead"]))
         elif line.startswith("**") and line.endswith("**"):
-            # Bold-only lines treated as headings
             story.append(Paragraph(line.strip("*"), styles["SectionHead"]))
         else:
-            # Regular paragraph — strip markdown bold markers for clean PDF
             clean = line.replace("**", "")
-            story.append(Paragraph(clean, styles["BodyText2"]))
-    
+            story.append(Paragraph(clean, styles["Body"]))
+
     story.append(Spacer(1, 10))
-    
-    # --- PESTEL Radar Chart (embedded as PNG image in PDF) ---
-    if pestel_data and "scores" in pestel_data:
-        story.append(Paragraph("PESTEL Analysis", styles["SectionHead"]))
+
+    # SWOT Analysis table
+    if swot_data:
+        story.append(Paragraph("SWOT Analysis", styles["SectionHead"]))
         story.append(Spacer(1, 4))
-        
-        # Extract PESTEL factor scores and explanations from Gemini's response
-        factors = ["Political", "Economic", "Social", "Technological", "Environmental", "Legal"]
-        industry_scores = [pestel_data["scores"].get(f, 3) for f in factors]
-        explanations = pestel_data.get("explanations", {})
-        
-        # Generate radar chart with matplotlib
-        # Angles are evenly spaced around 360 degrees (one per factor)
-        angles = np.linspace(0, 2 * np.pi, len(factors), endpoint=False).tolist()
-        # Close the polygon by repeating the first data point
-        industry_scores_plot = industry_scores + [industry_scores[0]]
-        angles_plot = angles + [angles[0]]
-        
-        fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
-        ax.plot(angles_plot, industry_scores_plot, 'o-', linewidth=2.5, 
-                label=industry, color='#2563EB', markersize=7)
-        ax.fill(angles_plot, industry_scores_plot, alpha=0.15, color='#2563EB')
-        ax.set_xticks(angles)
-        ax.set_xticklabels(factors, fontsize=10, fontweight='bold')
-        ax.set_ylim(0, 5)
-        ax.set_yticks([1, 2, 3, 4, 5])
-        ax.set_yticklabels(['1', '2', '3', '4', '5'], fontsize=8, color='grey')
-        ax.set_rlabel_position(30)
-        ax.grid(color='grey', linestyle='-', linewidth=0.3, alpha=0.5)
-        ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1), fontsize=10)
-        plt.tight_layout()
-        
-        # Save chart to in-memory buffer as PNG, then embed in PDF
-        chart_buffer = io.BytesIO()
-        fig.savefig(chart_buffer, format='png', dpi=150, bbox_inches='tight')
-        plt.close(fig)  # Free memory
-        chart_buffer.seek(0)
-        
-        # Add chart image to PDF document
-        from reportlab.platypus import Image
-        chart_img = Image(chart_buffer, width=400, height=400)
-        story.append(chart_img)
-        story.append(Spacer(1, 8))
-        
-        # Add PESTEL explanations as a formatted table below the chart
-        pestel_table_data = [[
+
+        swot_factors = ["Strengths", "Weaknesses", "Opportunities", "Threats"]
+        table_data = [[
             Paragraph("<b>Factor</b>", styles["CellBold"]),
-            Paragraph("<b>Score</b>", styles["CellBold"]),
-            Paragraph("<b>Explanation</b>", styles["CellBold"]),
+            Paragraph("<b>Details</b>", styles["CellBold"]),
         ]]
-        for i, factor in enumerate(factors):
-            pestel_table_data.append([
-                Paragraph(f"<b>{factor}</b>", styles["CellText"]),
-                Paragraph(f"{industry_scores[i]}/5", styles["CellText"]),
-                Paragraph(explanations.get(factor, ""), styles["CellText"]),
+        for factor in swot_factors:
+            points = swot_data.get(factor, [])
+            bullets = "<br/>".join(f"• {p}" for p in points)
+            table_data.append([
+                Paragraph(f"<b>{factor}</b>", styles["Cell"]),
+                Paragraph(bullets, styles["Cell"]),
             ])
-        
-        pestel_table = Table(pestel_table_data, 
-                           colWidths=[doc.width * 0.2, doc.width * 0.1, doc.width * 0.7])
-        pestel_table.setStyle(TableStyle([
+        t = Table(table_data, colWidths=[doc.width * 0.25, doc.width * 0.75])
+        t.setStyle(TableStyle([
             ("BOX", (0, 0), (-1, -1), 1.5, colors.black),
             ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.grey),
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
@@ -336,613 +189,449 @@ def generate_pdf(industry, report_text, sources, pestel_data=None):
             ("LEFTPADDING", (0, 0), (-1, -1), 6),
             ("RIGHTPADDING", (0, 0), (-1, -1), 6),
         ]))
-        story.append(pestel_table)
-    
-    # --- Footer ---
+        story.append(t)
+
     story.append(Spacer(1, 16))
-    story.append(Paragraph(
-        "Generated by Market Research Assistant | Sources: Wikipedia",
-        styles["SmallText"],
-    ))
-    
-    # Build the complete PDF and return the buffer for download
+    story.append(Paragraph("Generated by Market Research Assistant | Sources: Wikipedia", styles["Small"]))
+
     doc.build(story)
     buffer.seek(0)
     return buffer
 
-# =============================================================================
-# STEP 1 — Industry Input & Validation
-# =============================================================================
-# Task: Collect and validate the industry name from the user.
-# Subtasks: Check for empty input, special characters, and minimum length.
-# If validation fails, show helpful examples and stop execution.
+
+# STEP 1: Check the user's input (Q1, 25 marks)
+# The user types an industry name. We need to make sure it's valid before
+# doing anything else. This step has two parts:
+# 1a. Basic checks (empty, symbols, too short)
+# 1b. Ask Gemini if this is a real industry, and get key player names
+
 st.subheader("Step 1: Provide an Industry")
+
+# We use session_state to remember results so they don't disappear
+# when the user clicks buttons or interacts with the UI.
+if "suggestions" not in st.session_state:
+    st.session_state.suggestions = []
+if "report_data" not in st.session_state:
+    st.session_state.report_data = None
+
+# If the user just picked a suggestion, write it into the text input
+# before the widget renders so it shows up in the box.
+if st.session_state.get("_picked_suggestion"):
+    st.session_state.industry_input = st.session_state._picked_suggestion
+    st.session_state._picked_suggestion = None
+    st.session_state.suggestions = []
+
+# The key="industry_input" lets Streamlit remember what the user typed
+# across reruns. We only override it when picking a suggestion (above).
 industry = st.text_input(
     "Industry",
+    key="industry_input",
     placeholder="e.g. Renewable Energy, Semiconductor, Pharmaceutical",
 )
 
-# Button triggers the entire report generation pipeline
 run = st.button("Generate Report")
 
+# If Gemini previously suggested industries, show them as buttons.
+# The user picks one and it fills the text box.
+if st.session_state.suggestions:
+    st.info("Did you mean one of these?")
+    for suggestion in st.session_state.suggestions:
+        if st.button(f"✅ {suggestion}", key=f"suggest_{suggestion}"):
+            st.session_state._picked_suggestion = suggestion
+            st.rerun()
+
 if run:
-    # --- Validate API key ---
-    # The Gemini API key is required for all LLM calls; stop early if missing
+    # If there are old suggestions showing, clear them and rerun
+    # so they disappear before we start the pipeline.
+    if st.session_state.suggestions:
+        st.session_state.suggestions = []
+        st.rerun()
+
+    # Step 1a: Basic checks
+    # Make sure the user actually typed something sensible.
+
     if not api_key:
         st.error("Please enter your Google Gemini API key in the sidebar.")
         st.stop()
 
-    # --- Validate industry input ---
-    # Check 1: Empty input — user clicked Generate without typing anything
     if not industry or industry.strip() == "":
-        st.warning("⚠️ No industry provided. Please enter an industry name to continue.")
-        st.success("💡 Examples: Renewable Energy, Semiconductor, Pharmaceutical, Automotive, Ecommerce, AI")
+        st.warning("Please enter an industry name.")
+        st.info("Examples: Renewable Energy, Semiconductor, Pharmaceutical, Automotive")
         st.stop()
-    
-    # Remove leading/trailing whitespace for clean processing
-    industry = industry.strip()
-    
-    # Check 2: Special characters — only allow letters, numbers, and spaces
-    # This prevents potential issues with Wikipedia search queries
-    if not all(c.isalnum() or c.isspace() for c in industry):
-        st.warning("⚠️ Please enter an industry name without special characters or symbols.")
-        st.success("💡 Examples: Renewable Energy, Semiconductor, Pharmaceutical, Automotive, Ecommerce, AI")
-        st.stop()
-    
-    # Check 3: Minimum length — need at least 2 alphabetic characters
-    # Filters out inputs like "1" or single letters that aren't valid industries
-    alpha_chars = [c for c in industry if c.isalpha()]
-    if len(alpha_chars) < 2:
-        st.warning("⚠️ Please enter a valid industry name with at least 2 letters.")
-        st.success("💡 Examples: AI, IT, Renewable Energy, Semiconductor, Pharmaceutical")
-        st.stop()
-    
-    # All validation passed — show confirmation message
-    st.success(f"✅ Great! Generating report for: **{industry}**")
 
-    # --- Initialise Gemini API client ---
-    # Creates a client instance using the user's API key
+    industry = industry.strip()
+
+    # Allow letters, numbers, spaces, hyphens, parentheses, ampersand, and slashes.
+    # These cover common industry names like "Artificial Intelligence (AI)",
+    # "Oil & Gas", "IT/Technology". Block things like @#$%!^* that are clearly wrong.
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -()&/,.")
+    if not all(c in allowed for c in industry):
+        st.warning("Please enter an industry name without special characters like @, #, $, !, etc.")
+        st.info("Examples: Renewable Energy, Semiconductor, Artificial Intelligence (AI)")
+        st.stop()
+
+    # Need at least 2 letters so we don't get things like "1" or "a".
+    alpha_count = sum(1 for c in industry if c.isalpha())
+    if alpha_count < 2:
+        st.warning("Please enter a valid industry name with at least 2 letters.")
+        st.info("Examples: AI, IT, Renewable Energy, Semiconductor")
+        st.stop()
+
+    # Set up the Gemini client
     client = genai.Client(api_key=api_key)
 
-    # Maximum retry attempts for API calls
-    # Free-tier Gemini API has low rate limits (~15 requests/minute)
-    # Each retry waits progressively longer: 0s, 60s, 120s, 180s, 240s
-    max_retries = 5
+    st.success(f"✅ Generating report for: **{industry}**")
 
-    # =================================================================
-    # STEP 2 — Retrieve the 5 Most Relevant Wikipedia Pages
-    # =================================================================
-    # Task: Retrieve the 5 most relevant Wikipedia pages for the industry.
-    # 
-    # Approach: Content-based relevance scoring
-    # Instead of selecting pages by title alone (which can be misleading —
-    # e.g., "EA" appears for "Electronics" but is actually a gaming company),
-    # we send article CONTENT snippets to Gemini for relevance scoring.
-    # Articles scoring below the threshold are rejected, and the system
-    # re-searches until 5 relevant articles are found or options are exhausted.
-    #
-    # Flow:
-    #   2A. Search Wikipedia with multiple queries → collect candidates
-    #   2B. Filter out Wikipedia meta pages and stubs
-    #   2C. Send article titles + content snippets to Gemini → score relevance
-    #   2D. Keep articles scoring above threshold, reject the rest
-    #   2E. If < 5 found, identify key players and search for more candidates
-    #   2F. Score new candidates and repeat until 5 found or exhausted
+    # Step 1b: Ask Gemini if this is a real industry and get key players
+    # We combine two tasks into one LLM call to save API usage:
+    # 1. Is this input actually an industry?
+    # 2. If yes, who are the 2-3 biggest companies in it?
+    with st.spinner("Validating industry..."):
+        validate_prompt = (
+            f'Is "{industry}" a recognized industry or industry sector?\n\n'
+            f"If YES, respond with this JSON:\n"
+            f'{{"is_industry": true, "key_players": ["Company1", "Company2", "Company3"]}}\n'
+            f"List the 2-3 most dominant companies globally in this industry.\n\n"
+            f"If NO (e.g. it's a company name, a person, a random word, or a misspelling), "
+            f"suggest 3-5 closely related real industry names. Respond with:\n"
+            f'{{"is_industry": false, "suggestions": ["Industry 1", "Industry 2", "Industry 3", "Industry 4"]}}\n\n'
+            f"Return ONLY the JSON, nothing else."
+        )
+        validate_text = call_gemini(client, model_name, validate_prompt)
+        validate_result = parse_json(validate_text)
+
+    # If validate returns None, the API key might be bad or the model unavailable.
+    if validate_text is None:
+        st.error("Could not connect to Gemini. Please check your API key and model name.")
+        st.stop()
+
+    if validate_result is None:
+        st.warning("Could not validate the industry. Proceeding anyway...")
+        key_players = []
+    elif not validate_result.get("is_industry", True):
+        suggestions = validate_result.get("suggestions", [])
+        st.warning(f'"{industry}" doesn\'t look like a recognized industry name.')
+        if suggestions:
+            # Save the suggestions and rerun so the buttons appear
+            st.session_state.suggestions = suggestions
+            st.rerun()
+        else:
+            st.info("Try something like: Renewable Energy, Semiconductor, Pharmaceutical")
+        st.stop()
+    else:
+        key_players = validate_result.get("key_players", [])
+        # Key players are used internally for Wikipedia search, no need to show them.
+
+
+    # STEP 2: Get the 5 best Wikipedia pages (Q2, 25 marks)
+    # Wikipedia search by itself isn't great at finding the right pages.
+    # Sometimes you get unrelated articles that just happen to share keywords.
+    # So we do two things:
+    # 1. Search Wikipedia for the industry name AND for each key player
+    # 2. Let Gemini read the actual content of each page and pick the best 5
+
     st.subheader("Step 2: Retrieving Wikipedia Pages")
 
-    # Relevance score threshold (1-10 scale)
-    # Articles scoring below this are rejected as irrelevant
-    RELEVANCE_THRESHOLD = 7
+    progress = st.progress(0, text="Searching Wikipedia...")
 
-    # -----------------------------------------------------------------
-    # Helper: Score articles using Gemini (reads content, not just titles)
-    # -----------------------------------------------------------------
-    def score_articles(candidate_docs, industry, client, model_name, max_retries):
-        """
-        Send article titles + content snippets to Gemini for relevance scoring.
-        Gemini reads the first 300 words of each article to determine if the
-        article is genuinely relevant to the industry (not just keyword match).
-        
-        Returns a list of dicts: [{"index": 0, "score": 9, "reason": "..."}]
-        """
-        # Build snippets: title + first 300 words of content for each candidate
-        snippets = []
-        for i, doc in enumerate(candidate_docs):
-            title = doc.metadata.get("title", "Unknown")
-            # Use first 300 words — enough for Gemini to understand what the article is about
-            content_preview = " ".join(doc.page_content.split()[:300])
-            snippets.append(f"[{i}] {title}\n{content_preview}\n")
-        
-        snippets_text = "\n---\n".join(snippets)
-        
-        score_prompt = (
-            f"You are a market research analyst. Score each Wikipedia article below "
-            f"on how RELEVANT it is for writing a market research report about "
-            f"the **{industry}** industry.\n\n"
-            f"IMPORTANT: Read the article content carefully, not just the title. "
-            f"A company might have a name that sounds related but actually operates "
-            f"in a completely different industry (e.g., 'Electronic Arts' sounds like "
-            f"electronics but is actually a gaming company).\n\n"
-            f"Score each article 1-10:\n"
-            f"- 9-10: Directly about this industry or a major player in it\n"
-            f"- 7-8: Relevant technology, market, or significant company\n"
-            f"- 4-6: Loosely related but not core to this industry\n"
-            f"- 1-3: Unrelated or wrong industry entirely\n\n"
-            f"Articles:\n{snippets_text}\n\n"
-            f"Return ONLY a JSON array, one object per article:\n"
-            f'[{{"index": 0, "score": 9, "reason": "brief reason"}}, ...]\n'
-            f"Include ALL articles. No markdown, no extra text."
-        )
-        
-        for attempt in range(max_retries):
-            try:
-                if attempt > 0:
-                    time.sleep(60 * attempt)
-                score_response = client.models.generate_content(
-                    model=model_name,
-                    contents=score_prompt,
-                    config=types.GenerateContentConfig(temperature=0.0),
-                )
-                score_text = score_response.text.strip()
-                if score_text.startswith("```"):
-                    score_text = score_text.split("```")[1]
-                    if score_text.startswith("json"):
-                        score_text = score_text[4:]
-                return json.loads(score_text)
-            except Exception as e:
-                if "RESOURCE_EXHAUSTED" in str(e) and attempt < max_retries - 1:
-                    continue
-                else:
-                    return None
-        return None
+    # Step 2a: Search Wikipedia for industry pages and key player pages
+    # We search for the industry name to get general overview pages,
+    # and for each key player to get company-specific pages.
+    retriever = WikipediaRetriever(top_k_results=8, load_max_docs=8)
+    all_docs = []
+    seen_titles = set()
 
-    # -----------------------------------------------------------------
-    # STEP 2A — Search Wikipedia with multiple query variations
-    # -----------------------------------------------------------------
-    # Search with multiple query formats to cast a wide net
-    with st.spinner("Searching Wikipedia…"):
-        search_queries = [
-            f"{industry} industry",   # Targets industry overview pages
-            f"{industry} market",     # Targets market analysis pages
-            f"{industry}",            # General search as fallback
-        ]
-        
-        all_docs = []          # Stores all retrieved Wikipedia documents
-        seen_titles = set()    # Tracks page titles to prevent duplicates
-        
-        retriever = WikipediaRetriever(top_k_results=5, load_max_docs=5)
-        
-        for query in search_queries:
-            try:
-                results = retriever.invoke(query)
-                for doc in results:
-                    title = doc.metadata.get("title", "")
-                    if title not in seen_titles:
-                        seen_titles.add(title)
-                        all_docs.append(doc)
-            except Exception:
-                continue
+    # Search for the industry with two queries to get a good spread of pages.
+    # One for "industry" overview pages and one for "market" pages.
+    for query in [f"{industry} industry", f"{industry} market"]:
+        try:
+            results = retriever.invoke(query)
+            for doc in results:
+                title = doc.metadata.get("title", "")
+                if title not in seen_titles:
+                    seen_titles.add(title)
+                    all_docs.append(doc)
+        except Exception:
+            continue
+
+    # Search for each key player from Step 1c
+    player_retriever = WikipediaRetriever(top_k_results=1, load_max_docs=1)
+    for player in key_players:
+        try:
+            results = player_retriever.invoke(player)
+            for doc in results:
+                title = doc.metadata.get("title", "")
+                if title not in seen_titles:
+                    seen_titles.add(title)
+                    all_docs.append(doc)
+        except Exception:
+            continue
+
+    progress.progress(40, text="Filtering candidates...")
 
     if not all_docs:
-        st.error(
-            "No Wikipedia pages found for this industry. "
-            "Try a different or broader industry name."
-        )
+        st.error(f"No Wikipedia pages found for '{industry}'. Try a broader or different industry name.")
         st.stop()
 
-    # -----------------------------------------------------------------
-    # STEP 2B — Filter out Wikipedia meta pages and stubs
-    # -----------------------------------------------------------------
-    excluded_keywords = [
-        "disambiguation", "list of", "index of", "category:", 
-        "portal:", "template:", "wikipedia:", "file:"
-    ]
-    
-    candidate_docs = []
+    # Step 2b: Remove junk pages
+    # Wikipedia has meta pages like "List of..." or "Category:..." that
+    # are useless for a market report. We also skip country-specific pages
+    # like "Electronics industry in Japan" because we want a global perspective.
+    junk_keywords = ["disambiguation", "list of", "index of", "category:", "portal:", "template:"]
+    candidates = []
     for doc in all_docs:
         title = doc.metadata.get("title", "").lower()
-        if any(kw in title for kw in excluded_keywords):
+        if any(kw in title for kw in junk_keywords):
             continue
+        # Skip country-specific articles like "Electronics industry in Japan".
+        # We check if the title contains " in " followed by a known pattern.
+        title_original = doc.metadata.get("title", "")
+        if " in " in title_original:
+            after_in = title_original.split(" in ", 1)[-1].strip()
+            # Only skip if what comes after "in" looks like a country/region name
+            # (starts with uppercase and is short, like "Japan", "Bangladesh", "the United States")
+            if after_in and after_in[0].isupper() and len(after_in.split()) <= 4:
+                continue
         if len(doc.page_content.split()) < 100:
             continue
-        candidate_docs.append(doc)
+        candidates.append(doc)
 
-    if not candidate_docs:
-        st.error("No relevant pages found. Please try a different industry.")
+    if not candidates:
+        st.error("No useful Wikipedia pages found. Try a different industry name.")
         st.stop()
 
-    # -----------------------------------------------------------------
-    # STEP 2C — Score candidates by reading article CONTENT (not just titles)
-    # -----------------------------------------------------------------
-    # Gemini reads first 300 words of each article and scores relevance 1-10.
-    # This catches cases where a title sounds relevant but content is not
-    # (e.g., "Electronic Arts" for "Electronics" industry).
-    with st.spinner("Evaluating article relevance…"):
-        scores = score_articles(candidate_docs, industry, client, model_name, max_retries)
+    progress.progress(60, text="Checking relevance...")
 
-    # -----------------------------------------------------------------
-    # STEP 2D — Keep articles above threshold, reject the rest
-    # -----------------------------------------------------------------
-    approved_docs = []
-    rejected_titles = []
-    
-    if scores:
-        for item in scores:
-            idx = item.get("index", -1)
-            score = item.get("score", 0)
-            reason = item.get("reason", "")
-            if 0 <= idx < len(candidate_docs):
-                title = candidate_docs[idx].metadata.get("title", "Unknown")
-                if score >= RELEVANCE_THRESHOLD:
-                    approved_docs.append(candidate_docs[idx])
-                else:
-                    rejected_titles.append(f"{title} (score: {score}/10 — {reason})")
-    else:
-        # If scoring fails, fall back to using all candidates
-        approved_docs = candidate_docs
-
-    # Rejected articles are filtered out but not displayed in the UI
-    # if rejected_titles:
-    #     with st.expander(f"🔍 {len(rejected_titles)} article(s) rejected as irrelevant"):
-    #         for r in rejected_titles:
-    #             st.caption(f"❌ {r}")
-
-    # -----------------------------------------------------------------
-    # STEP 2E — If fewer than 5, search for key players and score them too
-    # -----------------------------------------------------------------
-    # When initial search doesn't yield enough relevant articles,
-    # we ask Gemini to identify key companies from the best overview page,
-    # search Wikipedia for those companies, and score the new results.
-    if len(approved_docs) < 5:
-        # Find the best overview from approved articles (or all candidates as fallback)
-        source_docs = approved_docs if approved_docs else candidate_docs
-        best_overview = max(source_docs, key=lambda d: len(d.page_content))
-        overview_text = best_overview.page_content[:6000]
-        
-        with st.spinner("Searching for more relevant articles…"):
-            # Ask Gemini to identify key players from overview
-            identify_prompt = (
-                f"Based on the following Wikipedia content about the {industry} industry, "
-                f"list the 6-8 most important COMPANIES in this industry globally. "
-                f"Focus on the largest, most dominant companies by revenue, market cap, "
-                f"or market share. Prioritize industry leaders and major corporations over "
-                f"smaller startups or niche players. "
-                f"Do NOT include concepts, technologies, datasets, or non-company entities. "
-                f"Return ONLY a JSON array of company names, nothing else. "
-                f"Example: [\"Google\", \"Microsoft\", \"OpenAI\"]\n\n"
-                f"Content:\n{overview_text}"
-            )
-            
-            key_players = []
-            for attempt in range(max_retries):
-                try:
-                    if attempt > 0:
-                        time.sleep(60 * attempt)
-                    identify_response = client.models.generate_content(
-                        model=model_name,
-                        contents=identify_prompt,
-                        config=types.GenerateContentConfig(temperature=0.0),
-                    )
-                    players_text = identify_response.text.strip()
-                    if players_text.startswith("```"):
-                        players_text = players_text.split("```")[1]
-                        if players_text.startswith("json"):
-                            players_text = players_text[4:]
-                    key_players = json.loads(players_text)
-                    break
-                except Exception as e:
-                    if "RESOURCE_EXHAUSTED" in str(e) and attempt < max_retries - 1:
-                        continue
-                    else:
-                        key_players = []
-                        break
-            
-            # Search Wikipedia for each key player
-            new_candidates = []
-            if key_players:
-                player_retriever = WikipediaRetriever(top_k_results=1, load_max_docs=1)
-                approved_titles = set(d.metadata.get("title", "") for d in approved_docs)
-                
-                for player in key_players:
-                    if player in seen_titles:
-                        continue
-                    try:
-                        player_docs = player_retriever.invoke(player)
-                        if player_docs:
-                            doc = player_docs[0]
-                            title = doc.metadata.get("title", "")
-                            if title not in seen_titles and title not in approved_titles:
-                                seen_titles.add(title)
-                                # Skip stubs
-                                if len(doc.page_content.split()) >= 100:
-                                    new_candidates.append(doc)
-                    except Exception:
-                        continue
-            
-            # Score the new candidates using content-based relevance
-            if new_candidates:
-                new_scores = score_articles(new_candidates, industry, client, model_name, max_retries)
-                if new_scores:
-                    for item in new_scores:
-                        idx = item.get("index", -1)
-                        score = item.get("score", 0)
-                        reason = item.get("reason", "")
-                        if 0 <= idx < len(new_candidates):
-                            title = new_candidates[idx].metadata.get("title", "Unknown")
-                            if score >= RELEVANCE_THRESHOLD:
-                                approved_docs.append(new_candidates[idx])
-                            else:
-                                rejected_titles.append(f"{title} (score: {score}/10 — {reason})")
-
-    # -----------------------------------------------------------------
-    # STEP 2F — Final selection: take top 5 by relevance, handle shortfall
-    # -----------------------------------------------------------------
-    # Limit to 5 articles maximum
-    docs = approved_docs[:5]
-
-    if len(docs) == 0:
-        st.error("No relevant pages found. Please try a different industry.")
-        st.stop()
-    
-    # If fewer than 5 relevant articles found, warn user with suggestion
-    if len(docs) < 5:
-        st.warning(
-            f"⚠️ Only {len(docs)} relevant Wikipedia pages found (target: 5). "
-            "Consider adjusting your industry name for better results "
-            "(e.g., 'Consumer Electronics' instead of 'Electronics')."
-        )
-
-    # Extract URLs and titles, then display as clickable links
-    urls = []
-    for doc in docs:
-        source = doc.metadata.get("source", "")
+    # Step 2c: Let Gemini pick the best 5 by reading actual content
+    # This is the key part. We don't just match titles, we send Gemini
+    # the first 300 words of each article so it can verify the page
+    # is actually about our industry.
+    snippets = []
+    for i, doc in enumerate(candidates):
         title = doc.metadata.get("title", "Unknown")
-        if source:
-            urls.append({"title": title, "url": source})
+        preview = " ".join(doc.page_content.split()[:300])
+        snippets.append(f"[{i}] {title}\n{preview}")
 
-    st.markdown(f"**Top {len(urls)} relevant Wikipedia pages:**")
-    for i, item in enumerate(urls, 1):
-        st.markdown(f"{i}. [{item['title']}]({item['url']})")
-
-    # =================================================================
-    # STEP 3 — Generate Industry Report + PESTEL Analysis
-    # =================================================================
-    # Task: Generate a concise market research report (< 500 words) with PESTEL visualisation.
-    # Subtasks:
-    #   3a. Convert selected Wikipedia pages to plain text context
-    #   3b. Send context + prompts to Gemini to generate the 4-section report
-    #   3c. Generate PESTEL scores via separate Gemini call
-    #   3d. Visualise PESTEL scores as radar chart using matplotlib
-    st.subheader("Step 3: Industry Report")
-
-    # Convert selected Wikipedia documents to a single text string
-    # max_chars_per_doc=5000 balances detail vs LLM token limits
-    context = convert_docs_to_text(docs, max_chars_per_doc=5000)
-
-    # Fill in the user prompt template with industry name and Wikipedia text
-    formatted_user_prompt = user_prompt.format(industry=industry, context=context)
-
-    # Call Gemini API to generate the market research report
-    # Includes exponential backoff retry logic for rate limit handling
-    for attempt in range(max_retries):
-        try:
-            with st.spinner(
-                "Generating report…"
-                if attempt == 0
-                else f"Rate limited. Waiting {60 * attempt}s then retrying ({attempt + 1}/{max_retries})…"
-            ):
-                if attempt > 0:
-                    time.sleep(60 * attempt)
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=formatted_user_prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_prompt,
-                        temperature=temperature,
-                    ),
-                )
-            break
-        except Exception as e:
-            if "RESOURCE_EXHAUSTED" in str(e) and attempt < max_retries - 1:
-                continue
-            else:
-                st.error(f"Error: {e}")
-                st.stop()
-
-    # Display the generated report
-    # Escape "$" signs to prevent Streamlit from rendering them as LaTeX
-    # (e.g., "$42.2 billion" would otherwise show as green math text)
-    st.markdown(response.text.replace("$", "\\$"))
-
-    # -----------------------------------------------------------------
-    # PESTEL Radar Chart
-    # -----------------------------------------------------------------
-    # PESTEL = Political, Economic, Social, Technological, Environmental, Legal
-    # This framework analyses the macro-environment affecting an industry.
-    # Each factor is scored 1-5 by Gemini based on the Wikipedia sources.
-    # The radar chart provides a visual summary of the industry's environment.
-    st.markdown("---")
-    # Visualisation of PESTEL factors scored 1-5 for the industry
-    st.markdown("### PESTEL Radar Chart")
-    
-    pestel_data = None
-
-    # Prompt asks Gemini to score each PESTEL factor and explain each score
-    # Returns structured JSON that we parse into scores and explanations
-    pestel_prompt = f"""You are a senior market research analyst. Based on the Wikipedia sources about the {industry} industry, score each PESTEL factor on a scale of 1-5 based on how FAVORABLE it is for the industry.
-
-Scoring guide:
-- 1 = Very unfavorable (major risk/threat)
-- 2 = Somewhat unfavorable
-- 3 = Neutral / mixed
-- 4 = Somewhat favorable
-- 5 = Very favorable (strong opportunity/tailwind)
-
-Also provide a brief explanation (max 15 words) for each factor score.
-
-Return your response in this EXACT JSON format (no markdown, no extra text):
-{{
-  "scores": {{
-    "Political": 3,
-    "Economic": 4,
-    "Social": 3,
-    "Technological": 5,
-    "Environmental": 2,
-    "Legal": 2
-  }},
-  "explanations": {{
-    "Political": "Brief explanation",
-    "Economic": "Brief explanation",
-    "Social": "Brief explanation",
-    "Technological": "Brief explanation",
-    "Environmental": "Brief explanation",
-    "Legal": "Brief explanation"
-  }}
-}}
-
-Be specific and analytical. Base scores on evidence from the Wikipedia content."""
-
-    # Call Gemini for PESTEL scoring (same retry logic as report generation)
-    pestel_response = None
-    for attempt in range(max_retries):
-        try:
-            with st.spinner(
-                "Generating PESTEL radar chart..."
-                if attempt == 0
-                else f"Rate limited. Waiting {60 * attempt}s then retrying ({attempt + 1}/{max_retries})…"
-            ):
-                if attempt > 0:
-                    time.sleep(60 * attempt)
-                pestel_response = client.models.generate_content(
-                    model=model_name,
-                    contents=pestel_prompt + f"\n\nWikipedia Context:\n{context}",
-                    config=types.GenerateContentConfig(
-                        temperature=temperature,
-                    ),
-                )
-            break
-        except Exception as e:
-            if "RESOURCE_EXHAUSTED" in str(e) and attempt < max_retries - 1:
-                continue
-            else:
-                st.error(f"Error generating PESTEL analysis: {e}")
-                pestel_response = None
-                break
-
-    if pestel_response:
-        try:
-            # Parse JSON response — handle markdown code block wrapping
-            pestel_text = pestel_response.text.strip()
-            if pestel_text.startswith("```"):
-                pestel_text = pestel_text.split("```")[1]
-                if pestel_text.startswith("json"):
-                    pestel_text = pestel_text[4:]
-            pestel_data = json.loads(pestel_text)
-            
-            # Extract scores for the 6 PESTEL factors
-            factors = ["Political", "Economic", "Social", "Technological", "Environmental", "Legal"]
-            industry_scores = [pestel_data["scores"].get(f, 3) for f in factors]
-            explanations = pestel_data.get("explanations", {})
-            
-            # --- Draw Radar Chart using matplotlib ---
-            # Calculate 6 evenly-spaced angles around a circle (one per factor)
-            angles = np.linspace(0, 2 * np.pi, len(factors), endpoint=False).tolist()
-            
-            # Close the polygon by appending the first value at the end
-            industry_scores_plot = industry_scores + [industry_scores[0]]
-            angles_plot = angles + [angles[0]]
-            
-            # Create a polar (radar) chart
-            fig, ax = plt.subplots(figsize=(7, 7), subplot_kw=dict(polar=True))
-            
-            # Plot scores as a filled polygon with markers at each point
-            ax.plot(angles_plot, industry_scores_plot, 'o-', linewidth=2.5, 
-                    label=industry, color='#2563EB', markersize=7)
-            ax.fill(angles_plot, industry_scores_plot, alpha=0.15, color='#2563EB')
-            
-            # Configure chart labels and grid
-            ax.set_xticks(angles)
-            ax.set_xticklabels(factors, fontsize=12, fontweight='bold')
-            ax.set_ylim(0, 5)          # Score range: 0 to 5
-            ax.set_yticks([1, 2, 3, 4, 5])
-            ax.set_yticklabels(['1', '2', '3', '4', '5'], fontsize=9, color='grey')
-            ax.set_rlabel_position(30)  # Angle for radial labels
-            ax.grid(color='grey', linestyle='-', linewidth=0.3, alpha=0.5)
-            ax.spines['polar'].set_color('grey')
-            ax.spines['polar'].set_linewidth(0.5)
-            ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1), fontsize=11)
-            ax.set_title(f"PESTEL Analysis: {industry}", fontsize=14, fontweight='bold', pad=20)
-            
-            plt.tight_layout()
-            # Render the matplotlib chart in the Streamlit app
-            st.pyplot(fig)
-            
-            # --- PESTEL Explanations Table ---
-            # HTML table showing each factor's score and explanation
-            st.caption("Scale: 1 = Very unfavorable → 5 = Very favorable")
-            
-            detail_html = "<table style='width:100%; border-collapse:collapse; margin:10px 0;'>"
-            detail_html += (
-                "<tr style='background-color:#f0f0f0;'>"
-                "<th style='border:1px solid #ccc; padding:8px; text-align:left;'>Factor</th>"
-                "<th style='border:1px solid #ccc; padding:8px; text-align:center;'>Score</th>"
-                "<th style='border:1px solid #ccc; padding:8px; text-align:left;'>Explanation</th>"
-                "</tr>"
-            )
-            for i, factor in enumerate(factors):
-                score = industry_scores[i]
-                expl = explanations.get(factor, "")
-                detail_html += (
-                    f"<tr>"
-                    f"<td style='border:1px solid #ccc; padding:8px; font-weight:bold;'>{factor}</td>"
-                    f"<td style='border:1px solid #ccc; padding:8px; text-align:center; "
-                    f"font-weight:bold;'>{score}/5</td>"
-                    f"<td style='border:1px solid #ccc; padding:8px;'>{expl}</td>"
-                    f"</tr>"
-                )
-            detail_html += "</table>"
-            st.markdown(detail_html, unsafe_allow_html=True)
-            
-        except Exception as e:
-            st.error(f"Error generating PESTEL analysis: {e}")
-
-    # =================================================================
-    # Word Count & PDF Download
-    # =================================================================
-    st.markdown("---")
-    
-    # Calculate total word count: report text + PESTEL factor names & explanations
-    # This gives a count closer to what Microsoft Word would show
-    total_text = response.text
-    if pestel_data and "explanations" in pestel_data:
-        # Include PESTEL content in the word count since it's part of the report
-        for factor, expl in pestel_data["explanations"].items():
-            total_text += f" {factor} {expl}"
-    
-    # Clean markdown formatting before counting words
-    # Remove symbols like **, ##, #, --- that aren't actual words
-    clean_text = total_text.replace("**", "").replace("##", "").replace("#", "")
-    clean_text = clean_text.replace("---", "").replace("- ", "").replace("* ", "")
-    clean_text = re.sub(r'\n+', ' ', clean_text)          # Newlines → spaces
-    clean_text = re.sub(r'\s+', ' ', clean_text).strip()   # Collapse whitespace
-    
-    word_count = len(clean_text.split())
-    st.caption(f"Word count: {word_count}")
-    if word_count >= 500:
-        st.warning("⚠️ Report exceeds 500 words. Consider regenerating.")
-    
-    # --- PDF Download ---
-    st.subheader("Download Report")
-
-    # Generate the PDF report in memory using ReportLab
-    pdf_buffer = generate_pdf(
-        industry=industry,
-        report_text=response.text,
-        sources=urls,
-        pestel_data=pestel_data,
+    select_prompt = (
+        f"You are selecting Wikipedia articles for a GLOBAL market research report about "
+        f"the **{industry}** industry.\n\n"
+        f"Read the CONTENT of each article below (not just the title). "
+        f"An article is relevant ONLY if its MAIN TOPIC is directly about:\n"
+        f"  - The {industry} industry itself (overview, history, market data)\n"
+        f"  - A company whose PRIMARY business is in the {industry} industry\n"
+        f"  - A product, service, or technology that is CORE to the {industry} industry\n\n"
+        f"REJECT articles where:\n"
+        f"  - The article only MENTIONS {industry} briefly but is mainly about something else\n"
+        f"  - The article is about a general topic (e.g. a country's economy, a broad technology) "
+        f"that is not specifically about the {industry} industry\n"
+        f"  - The company or topic belongs to a different industry\n"
+        f"  - The focus is on a single country or region only\n\n"
+        f"Among the relevant articles, PREFER ones with market size, revenue, or growth data.\n\n"
+        f"Articles:\n\n" + "\n\n---\n\n".join(snippets) + "\n\n"
+        f"Return ONLY a JSON array of the indices of the relevant articles, best first.\n"
+        f"Example: [2, 0, 5, 3, 7]\n"
+        f"If fewer than 5 are truly relevant, return fewer. Do NOT pad with loosely related articles."
     )
 
-    # Streamlit download button — allows user to save the PDF locally
+    with st.spinner("Selecting most relevant pages..."):
+        select_text = call_gemini(client, model_name, select_prompt)
+        selected_indices = parse_json(select_text)
+
+    # If Gemini's selection works, use it. Otherwise fall back to first 5 candidates.
+    docs = []
+    if selected_indices and isinstance(selected_indices, list):
+        for idx in selected_indices[:5]:
+            if isinstance(idx, int) and 0 <= idx < len(candidates):
+                docs.append(candidates[idx])
+
+    # If Gemini returned nothing useful, just use the first 5 candidates.
+    # This can happen if Gemini's response was malformed or indices were wrong.
+    if not docs:
+        docs = candidates[:5]
+
+    progress.progress(100, text="Done!")
+
+    if len(docs) < 5:
+        st.info(
+            f" It looks like **{industry}** might not have enough Wikipedia coverage "
+            f"to provide 5 relevant pages as expected. Could you try a broader or "
+            f"slightly different industry name so I can find better sources for you?"
+        )
+        st.stop()
+
+    # Show the selected pages as clickable links
+    sources = []
+    for doc in docs:
+        title = doc.metadata.get("title", "Unknown")
+        url = doc.metadata.get("source", "")
+        if url:
+            sources.append({"title": title, "url": url})
+
+    st.markdown(f"**Top {len(sources)} relevant Wikipedia pages:**")
+    for i, src in enumerate(sources, 1):
+        st.markdown(f"{i}. [{src['title']}]({src['url']})")
+
+
+    # STEP 3: Generate the report and SWOT analysis (Q3, 25 marks)
+    # We send all the Wikipedia content to Gemini in two focused calls:
+    # one for the market research report and one for the SWOT analysis.
+
+    st.subheader("Step 3: Industry Report")
+
+    # Turn the Wikipedia pages into text that Gemini can read
+    context = docs_to_text(docs, max_chars=5000)
+
+    # Check if the Wikipedia sources contain any recent data (2020+).
+    # If not, warn the user that the report may lack up-to-date figures.
+    recent_years = re.findall(r'\b(202[0-9])\b', context)
+    if not recent_years:
+        st.warning(
+            "⚠️ The Wikipedia sources for this industry do not appear to contain "
+            "recent data (2020 or later). The report may rely on qualitative insights "
+            "rather than up-to-date statistics."
+        )
+
+    # This is the main prompt. It tells Gemini exactly what we want:
+    # a 5-section report using ONLY the Wikipedia content.
+    report_system = (
+        "You are a senior market research analyst writing a GLOBAL industry report. "
+        "Take a worldwide perspective, not focused on any single country.\n\n"
+        "Base the report ONLY on the Wikipedia sources provided. Do NOT add any "
+        "information from your own knowledge. If a fact is not in the sources, leave it out.\n\n"
+        "Do NOT include source citations or references in the report text. "
+        "Keep it clean and easy to read.\n\n"
+        "QUANTITATIVE DATA IS ESSENTIAL. You MUST include specific numbers wherever "
+        "available in the sources: market size in dollars, growth rates in percentages, "
+        "company revenue figures, market share numbers, number of employees, units sold, "
+        "year-over-year changes. A good analyst always backs claims with numbers.\n\n"
+        "DATA RECENCY RULES (very important, current year is 2026):\n"
+        "- Always use the MOST RECENT data available in the sources (2020 or later only). "
+        "If both 2022 and 2024 figures exist, use the 2024 one. Skip anything before 2020.\n"
+        "- If the sources only have old data (before 2020), do NOT cite those numbers. "
+        "Instead focus on qualitative insights like market structure, competitive dynamics, "
+        "and strategic positioning.\n"
+        "- Always include the year when citing a number, e.g. 'revenue of $520B (2023)'.\n"
+        "- Never present old data as if it is current.\n\n"
+        "The report MUST have exactly these 5 sections, each with a markdown heading:\n"
+        "## Executive Summary\n50-70 words. The big picture and key takeaway.\n\n"
+        "## Market Size and Segments\n70-90 words. Global market size in dollars, growth rate, "
+        "and the main sub-segments.\n\n"
+        "## Key Players\n80-100 words. Use bullet points for this section only. "
+        "List 3-4 companies, each as a bullet starting with the company name in bold. "
+        "Include a number (revenue, market share) for each if available.\n\n"
+        "## Trends\n70-90 words. 2-3 key forces shaping this industry with data points.\n\n"
+        "## Outlook\n70-80 words. Growth trajectory, main risks, and opportunities.\n\n"
+        "WORD COUNT IS ABSOLUTELY CRITICAL. The report text MUST be between 330 and 370 "
+        "words. Count carefully. If your draft is under 330, go back and add more detail. "
+        "The SWOT analysis adds ~100-120 words on top, bringing the total to 430-490.\n"
+        "Write in clear, professional English. Each section should flow into the next.\n"
+        "Do NOT include a SWOT analysis in the report. Only write the 5 sections above. "
+        "SWOT is handled separately."
+    )
+
+    # Step 3a: Generate the report as plain markdown (not JSON).
+    # Letting the LLM write freely as markdown gives better word count
+    # control than asking it to stuff text inside a JSON string.
+    report_prompt = (
+        f"Write a market research report on the **{industry}** industry.\n\n"
+        f"Use ONLY the facts from these Wikipedia sources:\n\n{context}\n\n"
+        f"Write the report as clean markdown with ## headings.\n"
+        f"REMEMBER: 400 to 440 words. No less, no more."
+    )
+
+    with st.spinner("Generating report..."):
+        report = call_gemini(client, model_name, report_prompt, system_instruction=report_system)
+
+    if not report:
+        st.error("Failed to generate the report. Please try again.")
+        st.stop()
+
+    # Step 3b: Generate SWOT analysis in a separate quick call.
+    # SWOT (Strengths, Weaknesses, Opportunities, Threats) works much better
+    # with Wikipedia data than PESTEL because Wikipedia articles naturally
+    # cover things like industry advantages, challenges, and future trends.
+    swot_prompt = (
+        f"You are a senior market research analyst. Based on the Wikipedia sources "
+        f"about the **{industry}** industry, provide a SWOT analysis.\n\n"
+        f"Analyze the INDUSTRY AS A WHOLE, not any single company.\n"
+        f"Base your analysis ONLY on the Wikipedia sources provided.\n\n"
+        f"For each factor, provide exactly 2 bullet points. Each bullet should be "
+        f"10-18 words, specific and detailed enough to be useful to a business analyst. "
+        f"Include numbers or company names where relevant.\n\n"
+        f"Return ONLY JSON:\n"
+        f'{{"Strengths": ["point 1", "point 2"], '
+        f'"Weaknesses": ["point 1", "point 2"], '
+        f'"Opportunities": ["point 1", "point 2"], '
+        f'"Threats": ["point 1", "point 2"]}}\n\n'
+        f"Wikipedia context:\n{context[:3000]}"
+    )
+
+    with st.spinner("Generating SWOT analysis..."):
+        swot_text = call_gemini(client, model_name, swot_prompt)
+        swot_data = parse_json(swot_text)
+
+    # Save to session state so it doesn't disappear on UI interaction
+    st.session_state.report_data = {
+        "industry": industry,
+        "report": report,
+        "swot": swot_data,
+        "sources": sources,
+    }
+
+    # Display the report
+    st.markdown(report.replace("$", "\\$"))
+
+    # SWOT Analysis
+    # Display as a clean 2x2 grid showing Strengths, Weaknesses,
+    # Opportunities, and Threats for the industry.
+    if swot_data:
+        st.markdown("### SWOT Analysis")
+
+        swot_factors = ["Strengths", "Weaknesses", "Opportunities", "Threats"]
+        # Build the entire SWOT as one HTML table so the boxes
+        # are always aligned and equal height. Clean look, no icons.
+        def swot_cell(factor):
+            points = swot_data.get(factor, [])
+            bullets = "".join(f"<p style='margin:4px 0; font-size:14px;'>{p}</p>" for p in points)
+            return (
+                f"<td style='border:1px solid #ddd; border-radius:8px; "
+                f"padding:12px; width:50%; vertical-align:top;'>"
+                f"<h4 style='margin:0 0 8px 0;'>{factor}</h4>"
+                f"{bullets}</td>"
+            )
+
+        swot_html = (
+            "<table style='width:100%; border-collapse:separate; border-spacing:8px;'>"
+            f"<tr>{swot_cell('Strengths')}{swot_cell('Weaknesses')}</tr>"
+            f"<tr>{swot_cell('Opportunities')}{swot_cell('Threats')}</tr>"
+            "</table>"
+        )
+        st.markdown(swot_html, unsafe_allow_html=True)
+
+    # Word count includes both the report text AND SWOT points,
+    # since the assignment says "everything included except appendices and code."
+    total_text = report
+    if swot_data:
+        for factor, points in swot_data.items():
+            for point in points:
+                total_text += f" {point}"
+    clean = re.sub(r'[#*\-\n]+', ' ', total_text)
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    word_count = len(clean.split())
+    st.markdown("---")
+    st.caption(f"Word count (report + SWOT): {word_count}")
+    if word_count >= 500:
+        st.warning("Total exceeds 500 words. Consider regenerating.")
+
+    # PDF Download
+    st.markdown("---")
+    st.subheader("Download Report")
+    pdf_buffer = generate_pdf(
+        industry=industry,
+        report_text=report,
+        sources=sources,
+        swot_data=swot_data,
+    )
     st.download_button(
         label="📥 Download Report as PDF",
         data=pdf_buffer,
