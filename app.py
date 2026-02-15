@@ -217,8 +217,8 @@ if run: # Everything below only runs when the user clicks "Generate Report"
     retriever = WikipediaRetriever(top_k_results=8, load_max_docs=8) # fetches pages from Wikipedia's API
     all_docs = []           # list to collect all Wikipedia documents
     seen_titles = set()     # set to track which pages we've already seen (avoids duplicates)
-    # Search with two different query variations for broader coverage
-    for query in [f"{industry} industry", f"{industry} market"]:
+    # Search with multiple query variations for broader coverage
+    for query in [f"{industry} industry", f"{industry} market", f"{industry} sector", industry]:
         try:
             results = retriever.invoke(query) # calls the Wikipedia API and returns Document objects
             for doc in results:
@@ -303,7 +303,7 @@ if run: # Everything below only runs when the user clicks "Generate Report"
         f'Skip anything that is only about one country or region, about a single local market, one city, or a specific geographic marketplace. '
         f'Also skip articles that barely mention {industry}, or are about a different industry, or are too generic to be useful.\n\n'
         f'Below are the articles. Give me a JSON array of the indices of the ones you would keep, in order from most to least relevant. '
-        f'Example: [1, 0, 2, 4]. If there are fewer than 5 that truly fit, just return that many — do not add weak or off-topic ones.\n\n'
+        f'Example: [1, 0, 2, 4]. You MUST return exactly 5 indices. Include closely related sub-industries or key sectors if the direct matches are fewer than 5.\n\n'
         f'Articles:\n\n{"\n\n---\n\n".join(snippets)}\n\n'
         f'Return ONLY the JSON array of indices, nothing else.'
     )
@@ -321,6 +321,16 @@ if run: # Everything below only runs when the user clicks "Generate Report"
     # Fallback: if Gemini returned malformed response or bad indices
     if not docs:
         docs = candidates[:5]  # just use the first 5 candidates
+
+    # If LLM returned fewer than 5, fill remaining slots from unused candidates
+    if len(docs) < 5:
+        selected_titles = {doc.metadata.get("title", "") for doc in docs}
+        for doc in candidates:
+            if len(docs) >= 5:
+                break
+            if doc.metadata.get("title", "") not in selected_titles:
+                docs.append(doc)
+                selected_titles.add(doc.metadata.get("title", ""))
 
     progress.progress(100, text="Done!")
 
