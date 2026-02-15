@@ -113,7 +113,7 @@ if st.session_state.get("_picked_suggestion"):
 industry = st.text_input(
     "Industry",
     key="industry_input", # links this widget to st.session_state.industry_input so Streamlit remembers what the user typed across reruns.
-    placeholder="e.g. FMCG, Automotive, Technology", # shows grey hint text when the box is empty
+    placeholder="e.g. Retail, Automotive, Technology", # shows grey hint text when the box is empty
 )
 
 run = st.button("Generate Report") #creates a clickable button that user can click to trigger the report generation pipeline
@@ -134,13 +134,13 @@ if run: # Everything below only runs when the user clicks "Generate Report"
         st.stop() 
     if not industry or industry.strip() == "": # if the industry is empty or just whitespace, show a warning message and stop the execution
         st.warning("Please enter an industry name.")
-        st.info("Examples: FMCG, Automotive, Technology, Retail, Banking, Insurance, Healthcare, Education, etc.")
+        st.info("Examples: Retail, Automotive, Technology, Banking, Insurance, Healthcare, Education, etc.")
         st.stop()
     industry = industry.strip() # remove leading/trailing whitespace from the string
     allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -()&/,.") # set() creates an unordered collection of unique characters. This defines which characters are allowed in industry names.
     if not all(c in allowed for c in industry): # if the industry contains any special characters, show a warning message and stop the execution
         st.warning("Please enter an industry name without special characters like @, #, $, !, etc.")
-        st.info("Examples: FMCG, Automotive, Technology")
+        st.info("Examples: Retail, Automotive, Technology")
         st.stop()
     alpha_count = sum(1 for c in industry if c.isalpha()) # count how many letters are in the string
     if alpha_count < 2: # if the industry contains less than 2 letters, show a warning message and stop the execution
