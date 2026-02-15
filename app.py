@@ -270,9 +270,6 @@ if run: # Everything below only runs when the user clicks "Generate Report"
             after_in = title_original.split(" in ", 1)[-1].strip()
             if after_in and after_in[0].isupper() and len(after_in.split()) <= 4:
                 continue
-        # Skip pages about specific local/regional marketplaces
-        if re.search(r'\bmarket$', title):
-            continue
         if len(doc.page_content.split()) < 100: # skip if the page is too short
             continue
 
