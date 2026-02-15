@@ -109,6 +109,7 @@ if st.session_state.get("_picked_suggestion"):
     st.session_state.industry_input = st.session_state._picked_suggestion
     st.session_state._picked_suggestion = None   # clear the flag
     st.session_state.suggestions = []            # hide the suggestion buttons
+    st.session_state.suggestion_warning = None   # clear the warning message
 
 industry = st.text_input(
     "Industry",
@@ -119,6 +120,8 @@ industry = st.text_input(
 run = st.button("Generate Report") #creates a clickable button that user can click to trigger the report generation pipeline
 
 if st.session_state.get("suggestions"):
+    if st.session_state.get("suggestion_warning"):  # show the warning message if it exists
+        st.warning(st.session_state.suggestion_warning)
     st.info("Did you mean one of these?")  # shows a blue info box that displays the suggestions
     for suggestion in st.session_state.suggestions:
         if st.button(f"✅ {suggestion}", key=f"suggest_{suggestion}"): #creates a clickable button for each suggestion.
@@ -128,6 +131,7 @@ if st.session_state.get("suggestions"):
 if run: # Everything below only runs when the user clicks "Generate Report"
     if st.session_state.get("suggestions"): # Clear old suggestions before starting the pipeline
         st.session_state.suggestions = []
+        st.session_state.suggestion_warning = None
         st.rerun()
     if not api_key: # if the API key is not provided, show an error message and stop the execution
         st.error("Please enter your Google Gemini API key in the sidebar.")
@@ -294,7 +298,9 @@ if run: # Everything below only runs when the user clicks "Generate Report"
         f'Do NOT include small, regional, or niche companies. Prefer industry-overview and sector-level articles over company pages.\n'
         f'- Also skip articles that barely mention {industry}, or are about a different industry, or are too generic to be useful.\n\n'
         f'Below are the articles. Give me a JSON array of the indices of the ones you would keep, in order from most to least relevant. '
-        f'Example: [1, 0, 2, 4]. You MUST return exactly 5 indices. Only include articles that are genuinely useful — do NOT pad the list with weak or borderline matches just to reach 5. If fewer than 5 are truly relevant, return only those.\n\n'
+        f'Example: [1, 0, 2, 4]. Return ONLY articles that are genuinely useful for a GLOBAL industry report. '
+        f'Be strict — it is better to return 2-3 high-quality picks than 5 mediocre ones. '
+        f'Do NOT pad the list with weak or borderline matches. If only 3 articles are truly relevant, return only 3. Maximum is 5.\n\n'
         f'Articles:\n\n{"\n\n---\n\n".join(snippets)}\n\n'
         f'Return ONLY the JSON array of indices, nothing else.'
     )
@@ -309,9 +315,7 @@ if run: # Everything below only runs when the user clicks "Generate Report"
             if isinstance(idx, int) and 0 <= idx < len(candidates): # check if the index is an integer and within the valid range
                 docs.append(candidates[idx]) # add the document to the list of selected documents
 
-    # Fallback: if Gemini returned malformed response or bad indices
-    if not docs:
-        docs = candidates[:5]  # just use the first 5 candidates
+    # No fallback — if Gemini returned no valid indices, docs stays empty and the suggestion flow below will handle it
 
     progress.progress(100, text="Done!")
 
@@ -326,11 +330,10 @@ if run: # Everything below only runs when the user clicks "Generate Report"
         suggest_text = call_gemini(llm, suggest_prompt)
         alt_suggestions = parse_json(suggest_text)
 
-        st.warning(
-            f'"{industry}" doesn\'t have enough Wikipedia coverage to generate a full report with 5 sources. '
-            f'Try one of these alternative names:'
-        )
         if alt_suggestions and isinstance(alt_suggestions, list):
+            st.session_state.suggestion_warning = (
+                f'"{industry}" doesn\'t have enough Wikipedia coverage to generate a full report with 5 sources.'
+            )
             st.session_state.suggestions = alt_suggestions
             st.rerun()
         else:
@@ -404,7 +407,7 @@ if run: # Everything below only runs when the user clicks "Generate Report"
         f"Write an industry research report on the **{industry}** industry.\n\n"
         f"Use ONLY the facts from these Wikipedia sources:\n\n{context}\n\n"
         f"Write the report as clean markdown with ## headings.\n"
-        f"REMEMBER: 400 to 440 words. No less, no more."
+        f"REMEMBER: no more than 500 words."
     )
 
     report = call_gemini(llm, report_prompt, system_instruction=report_system)  # generate the industry research report
