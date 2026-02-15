@@ -3,8 +3,8 @@
 
 # Task 0: LLM selection dropdown + API key input (sidebar)
 # Task 1: Input validation (check if the input is provided and is a valid industry) + LLM token verification
-# Task  2: Assistant returns 5 most related Wikipedia  
-# Task  3: Industry report generation — LLM summarises 5 URLs of Wikipedia from section 2 into structured report 
+# Task 2: Assistant returns 5 most related URLs of Wikipedia pages
+# Task 3: Industry report generation — LLM summarises 5 URLs of Wikipedia into structured report 
 
 # Imports Libraries
 # Standard library (built into Python, no install needed)
@@ -190,11 +190,10 @@ if run: # Everything below only runs when the user clicks "Generate Report"
         # LLM returned text but it wasn't valid JSON — proceed without key_players
         key_players = []
 
-    # .get("is_industry", True) safely gets the value, defaulting to True if key missing
+    # get the value of the "is_industry" key, defaulting to True if the key is not found
     elif not validate_result.get("is_industry", True):
         # Input is NOT a valid industry — show suggestion buttons
         suggestions = validate_result.get("suggestions", [])
-        # \" inside a string is an escaped quote (lets us include quotes in the message)
         st.warning(f'"{industry}" doesn\'t look like a recognized industry name.')
         if suggestions:
             # Save suggestions to session state so they persist after rerun
@@ -210,8 +209,8 @@ if run: # Everything below only runs when the user clicks "Generate Report"
 
 
 
-    ## Task 2: Wikipedia retrieval
-    # Sub-task 2.1: Two-pronged Wikipedia search
+    # Task  2: Assistant returns 5 most related URLs of Wikipedia pages
+    # Sub-task 2.1: Two-pronged Wikipedia search 
     st.subheader("Step 2: Retrieving Wikipedia Pages")
     progress = st.progress(0, text="Searching Wikipedia...") # creates a progress bar. 0 = empty, 100 = full
     retriever = WikipediaRetriever(top_k_results=8, load_max_docs=8) # fetches pages from Wikipedia's API
@@ -250,8 +249,8 @@ if run: # Everything below only runs when the user clicks "Generate Report"
         st.error(f"No Wikipedia pages found for '{industry}'. Try a broader or different industry name.")
         st.stop()
 
-   # Sub-task 2.2: Rule-based junk filtering
-    # Remove pages that are obviously useless for an industry research report in order to be faster and cheaper than asking the LLM to evaluate every page
+   # Sub-task 2.2: Rule-based filtering
+   # Remove pages that are obviously unrelevant for an industry research report in order to be faster than asking the LLM to evaluate every page
     junk_keywords = ["disambiguation", "list of", "index of", "category:", "portal:", "template:"]
     candidates = []  # pages that pass the filter
 
@@ -259,17 +258,6 @@ if run: # Everything below only runs when the user clicks "Generate Report"
         title = doc.metadata.get("title", "").lower() # converts string to lowercase for case-insensitive comparison
         if any(kw in title for kw in junk_keywords): # skip if any junk keyword appears in the title
             continue
-        title_original = doc.metadata.get("title", "") # get the original title
-        # Skip country/region-specific articles so we keep a global perspective
-        country_phrases = [" in the united states", " in united states", " in the uk", " in the united kingdom",
-                           " in japan", " in china", " in germany", " in france", " in india", " in brazil",
-                           " in australia", " in canada", " in italy", " in spain", " in south korea", " in mexico"]
-        if any(phrase in title for phrase in country_phrases):
-            continue
-        if " in " in title_original:
-            after_in = title_original.split(" in ", 1)[-1].strip()
-            if after_in and after_in[0].isupper() and len(after_in.split()) <= 4:
-                continue
         if len(doc.page_content.split()) < 100: # skip if the page is too short
             continue
 
@@ -300,10 +288,13 @@ if run: # Everything below only runs when the user clicks "Generate Report"
         f'then big sectors or sub-industries that are clearly part of {industry}, '
         f'then core products or practices that define the industry. '
         f'Articles with real numbers (market size, revenue, growth) are especially helpful.\n\n'
-        f'Skip anything that is only about one country or region, about a single local market, one city, or a specific geographic marketplace. '
-        f'Also skip articles that barely mention {industry}, or are about a different industry, or are too generic to be useful.\n\n'
+        f'IMPORTANT RULES:\n'
+        f'- Skip anything that is only about one country or region, about a single local market, one city, or a specific geographic marketplace.\n'
+        f'- Skip articles about individual companies UNLESS they are one of the top 2-3 globally dominant players in the industry (e.g. companies with the largest worldwide market share or revenue). '
+        f'Do NOT include small, regional, or niche companies. Prefer industry-overview and sector-level articles over company pages.\n'
+        f'- Also skip articles that barely mention {industry}, or are about a different industry, or are too generic to be useful.\n\n'
         f'Below are the articles. Give me a JSON array of the indices of the ones you would keep, in order from most to least relevant. '
-        f'Example: [1, 0, 2, 4]. You MUST return exactly 5 indices. Include closely related sub-industries or key sectors if the direct matches are fewer than 5.\n\n'
+        f'Example: [1, 0, 2, 4]. You MUST return exactly 5 indices. Only include articles that are genuinely useful — do NOT pad the list with weak or borderline matches just to reach 5. If fewer than 5 are truly relevant, return only those.\n\n'
         f'Articles:\n\n{"\n\n---\n\n".join(snippets)}\n\n'
         f'Return ONLY the JSON array of indices, nothing else.'
     )
@@ -322,25 +313,28 @@ if run: # Everything below only runs when the user clicks "Generate Report"
     if not docs:
         docs = candidates[:5]  # just use the first 5 candidates
 
-    # If LLM returned fewer than 5, fill remaining slots from unused candidates
-    if len(docs) < 5:
-        selected_titles = {doc.metadata.get("title", "") for doc in docs}
-        for doc in candidates:
-            if len(docs) >= 5:
-                break
-            if doc.metadata.get("title", "") not in selected_titles:
-                docs.append(doc)
-                selected_titles.add(doc.metadata.get("title", ""))
-
     progress.progress(100, text="Done!")
 
-    # If fewer than 5 relevant pages were found, ask the user to try a different industry name
+    # Require exactly 5 relevant pages — if fewer, suggest alternative search terms
     if len(docs) < 5:
-        st.info(
-            f"It looks like **{industry}** might not have enough Wikipedia coverage "
-            f"to provide 5 relevant pages as expected. Could you try a broader or "
-            f"slightly different industry name so I can find better sources for you?"
+        suggest_prompt = (
+            f'The user searched for "{industry}" but Wikipedia does not have enough relevant pages for a full industry report.\n'
+            f'Suggest 3-5 alternative industry names that are closely related and likely to have better Wikipedia coverage.\n'
+            f'For example, if the user typed an abbreviation, suggest the full name. If the term is too narrow, suggest a broader industry.\n'
+            f'Return ONLY a JSON array of strings, e.g. ["Fast-moving consumer goods", "Consumer packaged goods", "Retail industry"].'
         )
+        suggest_text = call_gemini(llm, suggest_prompt)
+        alt_suggestions = parse_json(suggest_text)
+
+        st.warning(
+            f'"{industry}" doesn\'t have enough Wikipedia coverage to generate a full report with 5 sources. '
+            f'Try one of these alternative names:'
+        )
+        if alt_suggestions and isinstance(alt_suggestions, list):
+            st.session_state.suggestions = alt_suggestions
+            st.rerun()
+        else:
+            st.info("Try using the full industry name or a broader term.")
         st.stop()
 
     # Build a list of source dicts for the "Top N relevant Wikipedia pages" links
@@ -448,6 +442,7 @@ if run: # Everything below only runs when the user clicks "Generate Report"
     # Sub-task 3.3: Display the SWOT analysis as table  
     if swot_data:
         st.markdown("### SWOT Analysis")
+        st.markdown("SWOT summarises strengths and weaknesses within the industry, and opportunities and threats from the external environment, to provide a structured snapshot of key factors shaping performance and risk.")
         swot_factors = ["Strengths", "Weaknesses", "Opportunities", "Threats"] # list of the SWOT factors
         rows = ""  # HTML string to accumulate table rows
         for factor in swot_factors:
